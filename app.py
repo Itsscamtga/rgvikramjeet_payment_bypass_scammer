@@ -1,66 +1,74 @@
 from flask import Flask, request, jsonify
 import requests
-import requests
 import base64
 import json
-import re
-from bs4 import BeautifulSoup
-from base64 import b64encode
+import threading
+import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-import time
 
 app = Flask(__name__)
+results = {}  # Stores results by request ID
 
+# 🔹 Endpoint to start processing (Instant response)
 @app.route('/get_layer_two_data', methods=['GET'])
 def get_layer_two_data():
     try:
-        # Get query parameters
         tiles_input_data2 = request.args.get('tiles_input_data2', '').split('|')
         course_id = request.args.get('course_id', '')
         parent_id = request.args.get('parent_id', '')
         csrf_name = request.args.get('csrf_name', '')
-        
-        # Validate required parameters
-        if not all([tiles_input_data2, course_id, parent_id, csrf_name]):
-            return jsonify({
-                'status': 'error',
-                'message': 'Missing required parameters (tiles_input_data2, course_id, parent_id, csrf_name)'
-            }), 400
-        
-        # Create a new session
-        session = requests.Session()
-        
-        # Call your existing function
-        video_urls, pdf_urls = send_layer_two2_requests(
-            tiles_input_data2=tiles_input_data2,
-            course_id=course_id,
-            parent_id=parent_id,
-            csrf_name=csrf_name,
-            session=session
-        )
-        
-        # Return the results
-        return jsonify({
-            'status': 'success',
-            'data': {
-                'video_urls': video_urls,
-                'pdf_urls': pdf_urls
-            }
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 500
+        req_id = f"{course_id}_{parent_id}_{int(time.time())}"
 
-# Your existing functions (simple_encode_without_spaces and simple_decode need to be defined)
+        if not all([tiles_input_data2, course_id, parent_id, csrf_name]):
+            return jsonify({'status': 'error', 'message': 'Missing required parameters'}), 400
+
+        # Start background thread
+        thread = threading.Thread(
+            target=process_data,
+            args=(req_id, tiles_input_data2, course_id, parent_id, csrf_name)
+        )
+        thread.start()
+
+        return jsonify({
+            'status': 'processing',
+            'message': 'Processing started. Use /get_status?req_id=... to check progress.',
+            'req_id': req_id
+        })
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# 🔹 Endpoint to get status/result
+@app.route('/get_status', methods=['GET'])
+def get_status():
+    req_id = request.args.get("req_id", "")
+    if req_id in results:
+        return jsonify({'status': 'done', 'data': results.pop(req_id)})
+    return jsonify({'status': 'processing', 'message': 'Still working...'})
+
+# 🔹 Background data processing function
+def process_data(req_id, tiles_input_data2, course_id, parent_id, csrf_name):
+    session = requests.Session()
+    video_urls, pdf_urls = send_layer_two2_requests(
+        tiles_input_data2=tiles_input_data2,
+        course_id=course_id,
+        parent_id=parent_id,
+        csrf_name=csrf_name,
+        session=session
+    )
+    results[req_id] = {
+        'video_urls': video_urls,
+        'pdf_urls': pdf_urls
+    }
+
+# 🔹 Base64 encoding without space
 def simple_encode_without_spaces(data_dict):
     json_str = json.dumps(data_dict, separators=(',', ':'))
     encoded_bytes = base64.urlsafe_b64encode(json_str.encode('utf-8'))
     return encoded_bytes.decode('utf-8')
 
+# 🔹 Base64 decode
 def simple_decode(encoded_str):
     try:
         padded = encoded_str + '=' * (-len(encoded_str) % 4)
@@ -69,7 +77,7 @@ def simple_decode(encoded_str):
     except Exception as e:
         return {"error": str(e)}
 
-# Your existing send_layer_two2_requests function here
+# 🔹 Layer 2 data extraction
 def send_layer_two2_requests(tiles_input_data2, course_id, parent_id, csrf_name, session):
     url = 'https://rgvikramjeet.videocrypt.in/web/Course/get_layer_two_data'
 
@@ -110,7 +118,7 @@ def send_layer_two2_requests(tiles_input_data2, course_id, parent_id, csrf_name,
             data = {
                 'layer_two_input_data': payload_str,
                 'content': 'content',
-                'csrf_name': cookies['csrf_name']
+                'csrf_name': csrf_name
             }
 
             r = session.post(url, cookies=cookies, headers=headers, data=data)
@@ -139,7 +147,6 @@ def send_layer_two2_requests(tiles_input_data2, course_id, parent_id, csrf_name,
                         auth_response.raise_for_status()
                         auth_json = auth_response.json()
 
-                        # ✅ Check if vdc_id failed
                         if auth_json.get("status") is False:
                             raise ValueError("vdc_id returned status False")
 
@@ -156,14 +163,12 @@ def send_layer_two2_requests(tiles_input_data2, course_id, parent_id, csrf_name,
 
                     except Exception as ve:
                         print(f"⚠️ vdc_id failed: {vdc_id} → Fallback to join_url/file_url")
-                        # Fallback after vdc_id error
                         if file_url.endswith(".m3u8"):
                             final_url = file_url
                         elif join_url.endswith(".m3u8") or join_url.endswith(".pdf"):
                             final_url = join_url
 
                 else:
-                    # No vdc_id → directly use file or join URL
                     if file_url.endswith(".m3u8"):
                         final_url = file_url
                     elif join_url.endswith(".m3u8") or join_url.endswith(".pdf"):
@@ -176,7 +181,6 @@ def send_layer_two2_requests(tiles_input_data2, course_id, parent_id, csrf_name,
                         unique_entries.add(entry)
                     else:
                         print(f"⚠️ Duplicate video skipped: {entry}")
-
                 elif final_url.endswith(".pdf"):
                     if entry not in unique_entries:
                         pdf_urls.append(entry)
@@ -191,5 +195,6 @@ def send_layer_two2_requests(tiles_input_data2, course_id, parent_id, csrf_name,
 
     return video_urls, pdf_urls
 
+# 🔹 Run app
 if __name__ == '__main__':
     app.run(debug=True)
